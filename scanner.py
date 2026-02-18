@@ -1,6 +1,9 @@
+import argparse
 import socket
 import time
 from typing import Dict, List, Optional, Tuple
+
+import nmap
 from scapy.all import ARP, Ether, ICMP, IP, TCP, sr1, srp
 
 def scan_ip_addr(ip: str) -> Optional[str]:
@@ -67,21 +70,26 @@ def detect_service(ip: str, port: int) -> str:
     How to call: Using the nmap module with version detection enabled, this can be done with flag -sV.
     """
     try:
-        with socket.create_connection((ip, port), timeout=2) as conn:
-            conn.settimeout(2)
-            try:
-                banner = conn.recv(1024)
-                if banner:
-                    return banner.decode("utf-8", errors="replace").strip()
-            except socket.timeout:
-                pass
-    except (OSError, ConnectionError):
+        nm = nmap.PortScanner()
+        nm.scan(ip, str(port), arguments="-sV")
+        
+        if ip in nm.all_hosts():
+            if "tcp" in nm[ip] and port in nm[ip]["tcp"]:
+                port_info = nm[ip]["tcp"][port]
+                name = port_info.get("name", "")
+                product = port_info.get("product", "")
+                version = port_info.get("version", "")
+                
+                if product and version:
+                    return f"{product} {version}"
+                elif product:
+                    return product
+                elif name:
+                    return name
+    except Exception:
         pass
-
-    try:
-        return socket.getservbyport(port)
-    except OSError:
-        return "unknown"
+    
+    return "unknown"
 
 
 def scan_hostname(ip: str) -> Optional[str]:
@@ -104,17 +112,23 @@ def detect_os(ip: str, open_ports: List[int]) -> str:
     Output: OS guess string (e.g., "Linux 3.x-4.x")
     How to call: Also making use of the nmap module. To detect the OS the -O flag can be used.
     """
-    reply = sr1(IP(dst=ip) / ICMP(), timeout=2, verbose=0)
-    if reply is None or not reply.haslayer(IP):
-        return "unknown"
-
-    ttl = reply.getlayer(IP).ttl
-    if ttl >= 128:
-        return "Windows (TTL>=128)"
-    if ttl >= 64:
-        return "Linux/Unix (TTL>=64)"
+    try:
+        nm = nmap.PortScanner()
+        nm.scan(ip, arguments="-O")
+        
+        if ip in nm.all_hosts():
+            if "osmatch" in nm[ip] and nm[ip]["osmatch"]:
+                # Return the best OS match
+                best_match = nm[ip]["osmatch"][0]
+                name = best_match.get("name", "unknown")
+                accuracy = best_match.get("accuracy", "")
+                if accuracy:
+                    return f"{name} ({accuracy}% confidence)"
+                return name
+    except Exception:
+        pass
+    
     return "unknown"
-
 
 def perform_full_scan(target: str, port_range: Tuple[int, int]) -> Dict[str, object]:
     """
@@ -128,10 +142,19 @@ def perform_full_scan(target: str, port_range: Tuple[int, int]) -> Dict[str, obj
     if ip is None:
         return {"error": "unreachable"}
 
+    print("Scanning MAC address (ARP)...")
     mac = scan_mac_addr(ip)
+    
+    print(f"Scanning ports {port_range[0]}-{port_range[1]} (scapy SYN scan)...")
     open_ports = scan_open_ports(ip, port_range)
+    
+    print("Detecting services (nmap -sV)...")
     services = {port: detect_service(ip, port) for port in open_ports}
+    
+    print("Resolving hostname (DNS)...")
     hostname = scan_hostname(ip)
+    
+    print("Detecting OS (nmap -O)...")
     os_guess = detect_os(ip, open_ports)
 
     return {
@@ -148,18 +171,88 @@ def perform_full_scan(target: str, port_range: Tuple[int, int]) -> Dict[str, obj
 
 def main() -> None:
     """
-    CLI entry point with interactive inputs.
+    CLI entry point with flag-based argument parsing.
     """
-    print("Network Scanner Guide")
-    print("Run this program from a terminal and use the guide below to choose a command.")
-    print("-ip {target}) = Detect/Validate IP address")
-    print("-m {ip}) = Detect/Validate MAC address")
-    print("-v {ip}, {port}) Detect Services")
-    print("-h {ip}) Detect Hostname")
-    print("-os {ip}, {open_ports}) Detect OS")
-    print("-fs {target}, {port_range}) Perform full scan")
+    parser = argparse.ArgumentParser(
+        description="Network Scanner - Scan IP addresses, ports, and detect services",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scanner.py -ip 192.168.1.1
+  python scanner.py -mac 192.168.1.1
+  python scanner.py -ports 192.168.1.1 --start 20 --end 100
+  python scanner.py -service 192.168.1.1 -port 80
+  python scanner.py -host 8.8.8.8
+  python scanner.py -os 192.168.1.1
+  python scanner.py -fs 192.168.1.1 --start 1 --end 500
+        """
+    )
+    
+    # Mutually exclusive command flags
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-ip", metavar="TARGET", help="Detect/Validate IP address")
+    group.add_argument("-mac", metavar="IP", help="Detect MAC address")
+    group.add_argument("-ports", metavar="IP", help="Scan open ports")
+    group.add_argument("-service", metavar="IP", help="Detect service on a port")
+    group.add_argument("-host", metavar="IP", help="Resolve hostname from IP")
+    group.add_argument("-os", metavar="IP", help="Detect operating system")
+    group.add_argument("-fs", metavar="TARGET", help="Perform full scan")
+    
+    # Additional options
+    parser.add_argument("-port", type=int, help="Port number (for -service)")
+    parser.add_argument("--start", type=int, default=1, help="Start port (default: 1)")
+    parser.add_argument("--end", type=int, default=1024, help="End port (default: 1024)")
+    
+    args = parser.parse_args()
+    
+    # Check if any command was given
+    if not any([args.ip, args.mac, args.ports, args.service, args.host, args.os, args.fs]):
+        parser.print_help()
+        return
+    
+    if args.ip:
+        result = scan_ip_addr(args.ip)
+        if result:
+            print(f"Validated IP: {result}")
+    
+    elif args.mac:
+        result = scan_mac_addr(args.mac)
+        if result:
+            print(f"MAC Address: {result}")
+        else:
+            print("Could not detect MAC address")
+    
+    elif args.ports:
+        open_ports = scan_open_ports(args.ports, (args.start, args.end))
+        if open_ports:
+            print(f"Open ports: {open_ports}")
+        else:
+            print("No open ports found")
+    
+    elif args.service:
+        if args.port is None:
+            print("Error: -service requires -port")
+            return
+        service = detect_service(args.service, args.port)
+        print(f"Service on port {args.port}: {service}")
+    
+    elif args.host:
+        hostname = scan_hostname(args.host)
+        if hostname:
+            print(f"Hostname: {hostname}")
+        else:
+            print("Could not resolve hostname")
+    
+    elif args.os:
+        os_guess = detect_os(args.os, [])
+        print(f"OS Detection: {os_guess}")
+    
+    elif args.fs:
+        result = perform_full_scan(args.fs, (args.start, args.end))
+        print("\n=== Full Scan Results ===")
+        for key, value in result.items():
+            print(f"{key}: {value}")
 
-    # Use arguments example: "py scanner.py -ip 192.168.1.10"
 
 if __name__ == "__main__":
     main()

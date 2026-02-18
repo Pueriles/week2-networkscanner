@@ -89,3 +89,11 @@ User can scan:
 
 * Display progress during scanning
 * Show summary metrics after scan (e.g., time, hosts found, open ports)
+
+---
+
+## Usage Notes
+
+* Run the code from a terminal.
+* See the guide printed by the program for available commands and options.
+* You can use the terminal to execute commands and pass flags to the scanner.

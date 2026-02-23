@@ -1,39 +1,18 @@
 import argparse
 import logging
-import re
 import socket
-import subprocess
 import time
+import nmap
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
-
-# Suppress scapy warnings
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-
-import nmap
 from scapy.all import ARP, Ether, ICMP, IP, sr1, srp, conf, IFACES
 
-# Disable scapy verbose output and warnings
 conf.verb = 0
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
-
-def get_interface_for_ip(target_ip: str) -> Optional[str]:
-    """
-    Find the correct network interface for reaching a target IP.
-    Returns the interface name that's on the same subnet as the target.
-    """
-    target_octets = target_ip.split('.')[:3]
-    target_prefix = '.'.join(target_octets)
-    
-    for iface in IFACES.values():
-        if hasattr(iface, 'ip') and iface.ip:
-            iface_prefix = '.'.join(iface.ip.split('.')[:3])
-            if iface_prefix == target_prefix:
-                return iface.name
-    
-    # Fallback to default
-    return None
-
+# Interface for scans
+interface = "Ethernet"
 
 def parse_ip_range(ip_range: str) -> List[str]:
     """
@@ -43,7 +22,6 @@ def parse_ip_range(ip_range: str) -> List[str]:
       - 192.168.1.1-50 (range from .1 to .50)
       - 192.168.1.1-192.168.1.50 (full range)
     """
-    # Check for range with hyphen
     if "-" in ip_range:
         parts = ip_range.split("-")
         if len(parts) != 2:
@@ -52,9 +30,7 @@ def parse_ip_range(ip_range: str) -> List[str]:
         start_ip = parts[0].strip()
         end_part = parts[1].strip()
         
-        # Check if end_part is a full IP or just the last octet
         if "." in end_part:
-            # Full IP range: 192.168.1.1-192.168.1.50
             end_ip = end_part
             start_octets = list(map(int, start_ip.split(".")))
             end_octets = list(map(int, end_ip.split(".")))
@@ -65,7 +41,6 @@ def parse_ip_range(ip_range: str) -> List[str]:
             start_last = start_octets[3]
             end_last = end_octets[3]
         else:
-            # Short format: 192.168.1.1-50
             start_octets = start_ip.split(".")
             if len(start_octets) != 4:
                 raise ValueError(f"Invalid IP format: {start_ip}")
@@ -82,7 +57,6 @@ def parse_ip_range(ip_range: str) -> List[str]:
         base = ".".join(start_ip.split(".")[:3])
         return [f"{base}.{i}" for i in range(start_last, end_last + 1)]
     else:
-        # Single IP
         return [ip_range]
 
 
@@ -108,11 +82,11 @@ def parse_port_range(port_range: str) -> Tuple[int, int]:
         
         return (start_port, end_port)
     else:
-        # Single port
         port = int(port_range)
         if port < 1 or port > 65535:
             raise ValueError("Port number must be between 1 and 65535")
         return (port, port)
+
 
 def scan_ip_addr(ip: str, verbose: bool = True) -> Optional[str]:
     """
@@ -154,7 +128,7 @@ def scan_ip_range(ips: List[str], max_threads: int = 50) -> List[str]:
         except socket.gaierror:
             return None
         
-        # Method 1: ARP request (works for local network)
+        # First try ARP (works on local network)
         try:
             arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target)
             answers, _ = srp(arp_request, timeout=1, retry=0, verbose=0)
@@ -162,8 +136,7 @@ def scan_ip_range(ips: List[str], max_threads: int = 50) -> List[str]:
                 return target
         except Exception:
             pass
-        
-        # Method 2: ICMP ping
+        # Next try ICMP ping
         try:
             reply = sr1(IP(dst=target) / ICMP(), timeout=1, verbose=0)
             if reply is not None:
@@ -171,7 +144,7 @@ def scan_ip_range(ips: List[str], max_threads: int = 50) -> List[str]:
         except Exception:
             pass
         
-        # Method 3: TCP SYN to common ports
+        # Finally, try TCP SYN to common ports if ICMP gets blocked
         common_ports = [80, 443, 22, 21, 25, 445, 139, 3389, 8080]
         for port in common_ports:
             try:
@@ -198,6 +171,7 @@ def scan_ip_range(ips: List[str], max_threads: int = 50) -> List[str]:
     print(f"[+] Found {len(live_hosts)} live host(s)")
     return sorted(live_hosts, key=lambda x: [int(p) for p in x.split('.')])
 
+
 def scan_mac_addr(ip: str) -> Optional[str]:
     """
     Purpose: Detect MAC address
@@ -206,7 +180,7 @@ def scan_mac_addr(ip: str) -> Optional[str]:
     How to call: Use ARP protocol via scapy library (ARP() and srp() functions)
     """
     arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
-    answers, _ = srp(arp_request, timeout=2, retry=1, verbose=0, iface="Ethernet 3")
+    answers, _ = srp(arp_request, timeout=2, retry=1, verbose=0, iface=interface)
     for _, received in answers:
         return received.hwsrc.upper()
 
@@ -229,8 +203,9 @@ def scan_open_ports(ip: str, port_range: Tuple[int, int], max_threads: int = 100
         result = sock.connect_ex((ip, port))
         sock.close()
         return port if result == 0 else None
-    
     ports_to_scan = range(start_port, end_port + 1)
+    
+    # Use ThreadPoolExecutor to scan multiple ports in parallel
     with ThreadPoolExecutor(max_workers=min(max_threads, len(ports_to_scan))) as executor:
         futures = {executor.submit(check_port, port): port for port in ports_to_scan}
         for future in as_completed(futures):
@@ -239,6 +214,7 @@ def scan_open_ports(ip: str, port_range: Tuple[int, int], max_threads: int = 100
                 open_ports.append(result)
     
     return sorted(open_ports)
+
 
 def detect_service(ip: str, port: int, verbose: bool = True) -> str:
     """
@@ -250,20 +226,19 @@ def detect_service(ip: str, port: int, verbose: bool = True) -> str:
     try:
         nm = nmap.PortScanner()
         nm.scan(ip, str(port), arguments="-sV")
-        
         if ip in nm.all_hosts():
-            if "tcp" in nm[ip] and port in nm[ip]["tcp"]:
-                port_info = nm[ip]["tcp"][port]
-                name = port_info.get("name", "")
+            tcp_info = nm[ip].get("tcp", {})
+            port_info = tcp_info.get(port)
+            if port_info:
+                service = port_info.get("name", "")
                 product = port_info.get("product", "")
                 version = port_info.get("version", "")
-                
-                if product and version:
-                    return f"{product} {version}"
-                elif product:
-                    return product
-                elif name:
-                    return name
+                extrainfo = port_info.get("extrainfo", "")
+                banner = " ".join(x for x in [product, version, extrainfo] if x)
+                if banner.strip():
+                    return banner.strip()
+                elif service:
+                    return service
         else:
             if verbose:
                 print(f"[-] nmap: Host {ip} not found in scan results")
@@ -273,7 +248,6 @@ def detect_service(ip: str, port: int, verbose: bool = True) -> str:
     except Exception as e:
         if verbose:
             print(f"[-] Error detecting service: {e}")
-    
     return "unknown"
 
 
@@ -290,6 +264,7 @@ def scan_hostname(ip: str) -> Optional[str]:
     except (socket.herror, socket.gaierror):
         return None
 
+
 def detect_os(ip: str, open_ports: List[int], verbose: bool = True) -> str:
     """
     Purpose: Fingerprint operating system
@@ -300,11 +275,10 @@ def detect_os(ip: str, open_ports: List[int], verbose: bool = True) -> str:
     try:
         nm = nmap.PortScanner()
         nm.scan(ip, arguments="-O")
-        
+
         if ip in nm.all_hosts():
             if "osmatch" in nm[ip] and nm[ip]["osmatch"]:
-                # Return the best OS match
-                best_match = nm[ip]["osmatch"]
+                best_match = nm[ip]["osmatch"][0]
                 name = best_match.get("name", "unknown")
                 accuracy = best_match.get("accuracy", "")
                 if accuracy:
@@ -322,9 +296,9 @@ def detect_os(ip: str, open_ports: List[int], verbose: bool = True) -> str:
     except Exception as e:
         if verbose:
             print(f"[-] Error detecting OS: {e}")
-    
-    
+
     return "unknown"
+
 
 def perform_full_scan(target: str, port_range: Tuple[int, int]) -> Dict[str, object]:
     """
@@ -334,23 +308,22 @@ def perform_full_scan(target: str, port_range: Tuple[int, int]) -> Dict[str, obj
     How to call: Calls all above functions in sequence and aggregates data
     """
     start_time = time.time()
-    ip = scan_ip_addr(target, verbose=True)
+    ip = scan_ip_addr(target, verbose=False)
     if ip is None:
         return {"error": "unreachable"}
 
-    print("[*] Scanning MAC address...")
     mac = scan_mac_addr(ip)
-    
-    print(f"[*] Scanning ports {port_range[0]}-{port_range[1]}...")
+
     open_ports = scan_open_ports(ip, port_range)
-    
-    print("[*] Detecting services...")
-    services = {port: detect_service(ip, port, verbose=False) for port in open_ports}
-    
-    print("[*] Resolving hostname...")
+
+    services = {}
+    with ThreadPoolExecutor(max_workers=max(len(open_ports), 1)) as executor:
+        futures = {executor.submit(detect_service, ip, port, False): port for port in open_ports}
+        for future in as_completed(futures):
+            services[futures[future]] = future.result()
+
     hostname = scan_hostname(ip)
-    
-    print("[*] Detecting OS...")
+
     os_guess = detect_os(ip, open_ports, verbose=False)
 
     return {
@@ -386,30 +359,23 @@ Examples:
   python scanner.py -ip 192.168.1.1-3 -fs -p 1-500     # Full scan
         """
     )
-    
-    # Required IP argument
+    # Define command-line arguments
     parser.add_argument("-ip", metavar="TARGET", required=True, help="Target IP address or range (e.g., 192.168.1.1 or 192.168.1.1-50)")
-    
-    # Scan type flags (can combine multiple)
     parser.add_argument("-mac", action="store_true", help="Detect MAC address")
     parser.add_argument("-service", action="store_true", help="Detect service on port(s)")
     parser.add_argument("-host", action="store_true", help="Resolve hostname from IP")
     parser.add_argument("-os", action="store_true", help="Detect operating system")
     parser.add_argument("-fs", action="store_true", help="Perform full scan")
-    
-    # Additional options
     parser.add_argument("-p", help="Port or port range to scan, e.g., 80 or 20-100")
-    
+
     args = parser.parse_args()
-    
-    # Parse IP range
+    # Validate and parse IP range
     try:
         ips = parse_ip_range(args.ip)
     except ValueError as e:
         print(f"Error: {e}")
         return
-    
-    # Parse port range (only if -p specified or -fs/-service used)
+
     port_range = None
     if args.p:
         try:
@@ -418,10 +384,8 @@ Examples:
             print(f"Error: {e}")
             return
     elif args.fs:
-        # Default port range for full scan
         port_range = (1, 1024)
-    
-    # If no scan flags specified, just validate the IP
+
     if not any([args.mac, args.p, args.service, args.host, args.os, args.fs]):
         if len(ips) > 1:
             live_hosts = scan_ip_range(ips)
@@ -431,8 +395,7 @@ Examples:
             if result:
                 print(f"[+] Validated IP: {result}")
         return
-    
-    # For multiple IPs, first find live hosts in parallel
+
     if len(ips) > 1:
         print(f"[*] Discovering live hosts in range...")
         live_ips = scan_ip_range(ips)
@@ -441,26 +404,26 @@ Examples:
             return
     else:
         live_ips = ips
-    
-    # Collect results for final report
+
     all_results: List[Dict[str, object]] = []
     start_time = time.time()
-    
-    # Process each IP
-    for ip in live_ips:
+
+    # Scan each found host and aggregate results
+    def scan_host(ip: str) -> Dict[str, object]:
         result: Dict[str, object] = {"ip": ip}
-        
+
+        if args.fs:
+            print(f"[*] Scanning {ip}...")
+            scan_result = perform_full_scan(ip, port_range)
+            result.update(scan_result)
+            print(f"[+] Done scanning {ip}")
+            return result
+
         if len(ips) > 1:
             print(f"\n{'='*50}")
         print(f"[*] Scanning target: {ip}")
         print("="*50)
-        
-        if args.fs:
-            scan_result = perform_full_scan(ip, port_range)
-            result.update(scan_result)
-            all_results.append(result)
-            continue
-        
+
         if args.mac:
             print("[*] Detecting MAC address...")
             mac = scan_mac_addr(ip)
@@ -469,7 +432,7 @@ Examples:
                 print(f"[+] MAC Address: {mac}")
             else:
                 print("[-] Could not detect MAC address")
-        
+
         if args.p and not args.service:
             print(f"[*] Scanning ports {port_range[0]}-{port_range[1]}...")
             open_ports = scan_open_ports(ip, port_range)
@@ -478,11 +441,11 @@ Examples:
                 print(f"[+] Found {len(open_ports)} open port(s): {open_ports}")
             else:
                 print("[-] No open ports found")
-        
+
         if args.service:
             if port_range is None:
                 print("[-] Error: -service requires -p to specify port(s)")
-                return
+                return result
             print(f"[*] Scanning ports {port_range[0]}-{port_range[1]}...")
             open_ports = scan_open_ports(ip, port_range)
             result["open_ports"] = open_ports
@@ -492,12 +455,16 @@ Examples:
                 print(f"[+] Found {len(open_ports)} open port(s)")
                 print("[*] Detecting services...")
                 services = {}
-                for port in open_ports:
-                    service = detect_service(ip, port, verbose=False)
-                    services[port] = service
-                    print(f"    [+] Port {port}: {service}")
+                # Use ThreadPoolExecutor to detect services on multiple ports in parallel
+                with ThreadPoolExecutor(max_workers=max(len(open_ports), 1)) as executor:
+                    futures = {executor.submit(detect_service, ip, port, False): port for port in open_ports}
+                    for future in as_completed(futures):
+                        port = futures[future]
+                        service = future.result()
+                        services[port] = service
+                        print(f"    [+] Port {port}: {service}")
                 result["services"] = services
-        
+
         if args.host:
             print("[*] Resolving hostname...")
             hostname = scan_hostname(ip)
@@ -506,31 +473,36 @@ Examples:
                 print(f"[+] Hostname: {hostname}")
             else:
                 print("[-] Could not resolve hostname")
-        
+
         if args.os:
             print("[*] Detecting operating system...")
             os_guess = detect_os(ip, [], verbose=False)
             result["os"] = os_guess
             print(f"[+] OS: {os_guess}")
-        
-        all_results.append(result)
-    
-    # Print final report
+
+        return result
+    # Use ThreadPoolExecutor to scan multiple hosts in parallel
+    with ThreadPoolExecutor(max_workers=len(live_ips)) as executor:
+        futures = [executor.submit(scan_host, ip) for ip in live_ips]
+        for future in as_completed(futures):
+            all_results.append(future.result())
+
+    # Print summary report
     duration = round(time.time() - start_time, 2)
     print("\n")
     print("="*50)
     print("                  SCAN REPORT")
     print("="*50)
-    
+
     for result in all_results:
         ip_addr = result.get('ip', 'N/A')
         print(f"\nTarget: {ip_addr}")
         print("-"*30)
-        
+
         if result.get("error"):
             print(f"  Status:       {result['error']}")
             continue
-        
+
         if "mac" in result:
             print(f"  MAC Address:  {result['mac'] or 'Not found'}")
         if "hostname" in result:
@@ -551,7 +523,7 @@ Examples:
                 print("  Open Ports:   None found")
         if "duration_seconds" in result:
             print(f"  Scan Time:    {result['duration_seconds']}s")
-    
+
     print(f"\nTotal scan completed in {duration} seconds")
     print("="*50)
 
